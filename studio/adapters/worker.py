@@ -1,91 +1,92 @@
 """
 Background worker for async queue processing.
+
+Audit fix requirements:
+- Worker must pull jobs from engine.generation_queue only.
+- Worker must await engine.generate() internally.
+- Worker must use the SAME StudioEngine instance injected into application.bot_data.
+- Remove global engine variables.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+from io import BytesIO
 
-from ..core.engine import StudioEngine
-from ..schema.params import GenerationParams
+from telegram.ext import Application
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["start_worker_loop"]
 
-# Global worker state
-worker_engine: Optional[StudioEngine] = None
-worker_running = False
 
+async def start_worker_loop(application: Application) -> None:
+    engine = application.bot_data.get("engine")
+    if engine is None:
+        raise RuntimeError("StudioEngine not initialized in application.bot_data")
 
-async def start_worker_loop() -> None:
-    """
-    Start background worker loop for processing generation queue.
-    
-    This runs continuously and processes jobs from the engine's queue.
-    """
-    global worker_engine, worker_running
-    
-    if worker_running:
-        logger.warning("Worker loop already running")
-        return
-    
-    worker_running = True
-    worker_engine = StudioEngine()
-    
     logger.info("Worker loop started")
-    
-    try:
-        # Load models on startup
-        await worker_engine.load_models()
+
+    if not engine.state.base_models:
+        await engine.load_models()
         logger.info("Worker models loaded")
-        
-        while worker_running:
+
+    while True:
+        job = await engine.generation_queue.get()
+        engine.current_job = job
+
+        chat_id = job.get("chat_id")
+        message_id = job.get("message_id")
+        params = job.get("params")
+
+        async def progress_callback(message: str):
             try:
-                # Check for jobs in queue with timeout
-                try:
-                    job = await asyncio.wait_for(
-                        worker_engine.queue.get(),
-                        timeout=5.0
-                    )
-                except asyncio.TimeoutError:
-                    continue
-                
-                # Process job
-                logger.info(f"Processing job: {job.get('id')}")
-                worker_engine.current_job = job
-                
-                params = job["params"]
-                callback = job.get("callback")
-                
-                try:
-                    result = await worker_engine.generate(
-                        params,
-                        progress_callback=callback
-                    )
-                    
-                    # Notify completion
-                    if callback:
-                        await callback(f"✅ Complete ({result.total_time:.1f}s)")
-                    
-                    logger.info(f"Job {job.get('id')} completed")
-                    
-                except Exception as e:
-                    logger.error(f"Job {job.get('id')} failed: {e}")
-                    if callback:
-                        await callback(f"❌ Failed: {e}")
-                
-                finally:
-                    worker_engine.current_job = None
-                    worker_engine.queue.task_done()
-            
-            except Exception as e:
-                logger.exception(f"Worker loop error: {e}")
-                await asyncio.sleep(1)
-    
-    except asyncio.CancelledError:
-        logger.info("Worker loop cancelled")
-    finally:
-        worker_running = False
-        logger.info("Worker loop stopped")
+                await application.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=f"⏳ {message}",
+                )
+            except Exception:
+                return
+
+        try:
+            await progress_callback("Generating...")
+            result = await engine.generate(params, progress_callback=progress_callback)
+
+            bio = BytesIO()
+            result.image.save(bio, format="PNG")
+            bio.seek(0)
+
+            await application.bot.send_photo(
+                chat_id=chat_id,
+                photo=bio,
+                caption=(
+                    f"✨ Generated in {result.total_time:.1f}s\n"
+                    f"Model: {params.base_model}\n"
+                    f"Resolution: {params.width}x{params.height}\n"
+                    f"Steps: {params.steps} | CFG: {params.cfg}"
+                ),
+            )
+
+            try:
+                await application.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text="✅ Complete",
+                )
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.exception(f"Job failed: {e}")
+            try:
+                await application.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=f"❌ Failed: {e}",
+                )
+            except Exception:
+                pass
+        finally:
+            engine.current_job = None
+            engine.generation_queue.task_done()

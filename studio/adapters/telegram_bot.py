@@ -4,7 +4,6 @@ Telegram bot application setup and configuration.
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 from telegram.ext import (
     Application,
@@ -38,32 +37,20 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["create_bot_application"]
 
-# Global engine instance (shared across handlers)
-engine: Optional[StudioEngine] = None
-
-
-def get_engine() -> StudioEngine:
-    """Get or create global engine instance."""
-    global engine
-    if engine is None:
-        engine = StudioEngine()
-    return engine
-
 
 def create_bot_application(token: str) -> Application:
     """
     Create configured Telegram bot application.
-    
-    Args:
-        token: Telegram bot token
-        
-    Returns:
-        Configured Application instance
+
+    Required behavior:
+    - Create exactly one StudioEngine instance.
+    - Inject it into Application via bot_data['engine'].
     """
-    # Build application
     application = Application.builder().token(token).build()
-    
-    # Conversation handler for generation flow
+
+    engine = StudioEngine()
+    application.bot_data["engine"] = engine
+
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("generate", start_command)],
         states={
@@ -82,17 +69,15 @@ def create_bot_application(token: str) -> Application:
         },
         fallbacks=[CommandHandler("cancel", cancel_command)],
     )
-    
-    # Add handlers
+
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(conv_handler)
-    
-    # Callback handlers for settings and regeneration
+
     application.add_handler(CallbackQueryHandler(settings_callback, pattern="^settings_"))
     application.add_handler(CallbackQueryHandler(regenerate_callback, pattern="^regen_"))
     application.add_handler(CallbackQueryHandler(button_callback))
-    
+
     logger.info("Bot application configured")
     return application

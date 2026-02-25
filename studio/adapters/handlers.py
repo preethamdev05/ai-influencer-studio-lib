@@ -1,18 +1,22 @@
 """
 Telegram bot command and callback handlers.
+
+Audit fix requirements:
+- Handlers must NEVER call await engine.generate(params) directly.
+- Enqueue all generation jobs to engine.generation_queue.
+- Status must report queue size from engine.generation_queue.
+- Engine instance must be retrieved from context.application.bot_data['engine'].
 """
 from __future__ import annotations
 
-import asyncio
 import logging
-from typing import Optional
+import time
+from dataclasses import asdict
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler
 
 from ..schema.params import GenerationParams
-from ..schema.errors import GenerationError
-from .telegram_bot import get_engine
 
 logger = logging.getLogger(__name__)
 
@@ -34,20 +38,17 @@ __all__ = [
     "ENTERING_PROMPT",
 ]
 
-# Conversation states
 SELECTING_MODEL = 1
 SELECTING_STYLE = 2
 SELECTING_RESOLUTION = 3
 ENTERING_PROMPT = 4
 
-# Resolution presets
 RESOLUTIONS = {
     "portrait": (832, 1216),
     "landscape": (1216, 832),
     "square": (1024, 1024),
 }
 
-# Model display names
 MODEL_NAMES = {
     "juggernaut": "Juggernaut XL",
     "lustify": "Lustify",
@@ -55,10 +56,14 @@ MODEL_NAMES = {
 }
 
 
+def _get_engine(context: ContextTypes.DEFAULT_TYPE):
+    engine = context.application.bot_data.get("engine")
+    if engine is None:
+        raise RuntimeError("StudioEngine not initialized in bot_data")
+    return engine
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Start command - initialize generation flow.
-    """
     keyboard = [
         [
             InlineKeyboardButton("Juggernaut XL", callback_data="model_juggernaut"),
@@ -69,30 +74,25 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
-        "Welcome to AI Influencer Studio! 🎨\n\n"
-        "Select a base model to start:",
-        reply_markup=reply_markup,
-    )
-    
-    # Initialize user data
+
+    if update.message:
+        await update.message.reply_text(
+            "Welcome to AI Influencer Studio!\n\nSelect a base model to start:",
+            reply_markup=reply_markup,
+        )
+
     context.user_data["params"] = GenerationParams()
-    
     return SELECTING_MODEL
 
 
 async def model_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Handle model selection callback.
-    """
     query = update.callback_query
     await query.answer()
-    
+
     model_name = query.data.replace("model_", "")
     params = context.user_data["params"]
     context.user_data["params"] = params.replace(base_model=model_name)
-    
+
     keyboard = [
         [
             InlineKeyboardButton("Realistic", callback_data="style_realistic"),
@@ -104,78 +104,60 @@ async def model_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
+
     await query.edit_message_text(
-        f"Model: {MODEL_NAMES[model_name]} ✓\n\n"
-        "Select a style:",
+        f"Model: {MODEL_NAMES.get(model_name, model_name)} ✓\n\nSelect a style:",
         reply_markup=reply_markup,
     )
-    
+
     return SELECTING_STYLE
 
 
 async def style_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Handle style selection callback.
-    """
     query = update.callback_query
     await query.answer()
-    
+
     style = query.data.replace("style_", "")
     context.user_data["style"] = style
-    
+
     keyboard = [
-        [
-            InlineKeyboardButton("Portrait (832x1216)", callback_data="res_portrait"),
-        ],
-        [
-            InlineKeyboardButton("Landscape (1216x832)", callback_data="res_landscape"),
-        ],
-        [
-            InlineKeyboardButton("Square (1024x1024)", callback_data="res_square"),
-        ],
+        [InlineKeyboardButton("Portrait (832x1216)", callback_data="res_portrait")],
+        [InlineKeyboardButton("Landscape (1216x832)", callback_data="res_landscape")],
+        [InlineKeyboardButton("Square (1024x1024)", callback_data="res_square")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
+
     await query.edit_message_text(
-        f"Style: {style.title()} ✓\n\n"
-        "Select resolution:",
+        f"Style: {style.title()} ✓\n\nSelect resolution:",
         reply_markup=reply_markup,
     )
-    
+
     return SELECTING_RESOLUTION
 
 
 async def resolution_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Handle resolution selection callback.
-    """
     query = update.callback_query
     await query.answer()
-    
+
     res_key = query.data.replace("res_", "")
     width, height = RESOLUTIONS[res_key]
-    
+
     params = context.user_data["params"]
     context.user_data["params"] = params.replace(width=width, height=height)
-    
+
     await query.edit_message_text(
-        f"Resolution: {width}x{height} ✓\n\n"
-        "Now send your prompt (describe what you want to generate):"
+        f"Resolution: {width}x{height} ✓\n\nNow send your prompt:",
     )
-    
+
     return ENTERING_PROMPT
 
 
 async def prompt_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Handle prompt text and start generation.
-    """
+    engine = _get_engine(context)
+
     prompt_text = update.message.text
-    params = context.user_data["params"]
-    params = params.replace(prompt=prompt_text)
-    
-    # Apply style modifications
+    params = context.user_data["params"].replace(prompt=prompt_text)
+
     style = context.user_data.get("style", "default")
     if style == "realistic":
         params = params.replace(loras=["detail", "identity"])
@@ -183,148 +165,90 @@ async def prompt_received(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         params = params.replace(cfg=8.0, loras=["detail"])
     elif style == "artistic":
         params = params.replace(cfg=9.0, use_refiner=True)
-    
-    # Store final params
+
     context.user_data["params"] = params
-    
-    # Send initial status
-    status_msg = await update.message.reply_text(
-        "⏳ Adding to queue..."
-    )
-    
-    try:
-        # Get engine and generate
-        engine = get_engine()
-        
-        # Ensure models loaded
-        if not engine.state.base_models:
-            await status_msg.edit_text("🔄 Loading models (first time)...")
-            await engine.load_models()
-        
-        # Progress callback
-        async def progress_callback(message: str):
-            await status_msg.edit_text(f"⏳ {message}")
-        
-        # Generate image
-        await status_msg.edit_text("🎨 Generating...")
-        result = await engine.generate(params, progress_callback=progress_callback)
-        
-        # Send result
-        await update.message.reply_photo(
-            photo=result.image,
-            caption=(
-                f"✨ Generated in {result.total_time:.1f}s\n"
-                f"Model: {MODEL_NAMES[params.base_model]}\n"
-                f"Resolution: {params.width}x{params.height}\n"
-                f"Steps: {params.steps} | CFG: {params.cfg}"
-            ),
-        )
-        
-        await status_msg.delete()
-        
-    except GenerationError as e:
-        await status_msg.edit_text(f"❌ Generation failed: {e}")
-        logger.error(f"Generation error: {e}")
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Unexpected error: {e}")
-        logger.exception("Unexpected error during generation")
-    
+
+    queued_msg = await update.message.reply_text("⏳ Queued")
+
+    job_payload = {
+        "id": f"job_{update.effective_user.id}_{int(time.time() * 1000)}",
+        "user_id": update.effective_user.id,
+        "chat_id": update.effective_chat.id,
+        "message_id": queued_msg.message_id,
+        "params": params,
+    }
+
+    await engine.generation_queue.put(job_payload)
+
     return ConversationHandler.END
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Help command - show available commands.
-    """
     help_text = (
-        "🤖 AI Influencer Studio Commands:\n\n"
+        "AI Influencer Studio Commands:\n\n"
         "/generate - Start new generation\n"
         "/status - Check bot status\n"
         "/cancel - Cancel current operation\n"
-        "/help - Show this message\n\n"
-        "Features:\n"
-        "• Multiple SDXL models\n"
-        "• Style presets\n"
-        "• Resolution options\n"
-        "• LoRA support\n"
-        "• Dual-GPU refinement\n"
+        "/help - Show this message\n"
     )
     await update.message.reply_text(help_text)
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Status command - show engine status.
-    """
-    engine = get_engine()
+    engine = _get_engine(context)
     status = engine.get_status()
-    
+
+    queue_size = engine.generation_queue.qsize()
+
     status_text = (
-        f"🔧 Engine Status:\n\n"
+        f"Engine Status:\n\n"
         f"Models loaded: {status['models_loaded']}\n"
-        f"Queue size: {status['queue_size']}\n"
+        f"Queue size: {queue_size}\n"
         f"Active job: {'Yes' if status['current_job'] else 'No'}\n\n"
         f"GPU 0 VRAM: {status['vram_stage1'].get('allocated_gb', 0):.1f}GB / "
         f"{status['vram_stage1'].get('total_gb', 0):.1f}GB\n"
         f"GPU 1 VRAM: {status['vram_stage2'].get('allocated_gb', 0):.1f}GB / "
         f"{status['vram_stage2'].get('total_gb', 0):.1f}GB"
     )
-    
+
     await update.message.reply_text(status_text)
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Cancel command - abort current conversation.
-    """
     await update.message.reply_text("Operation cancelled.")
     return ConversationHandler.END
 
 
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handle settings adjustment callbacks.
-    """
     query = update.callback_query
     await query.answer()
-    
-    # Parse setting change
-    data = query.data.replace("settings_", "")
-    # Implementation for advanced settings UI
     await query.edit_message_text("Settings panel (to be implemented)")
 
 
 async def regenerate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handle image regeneration callbacks.
-    """
     query = update.callback_query
     await query.answer()
-    
-    # Regenerate with stored params
+
+    engine = _get_engine(context)
     params = context.user_data.get("params")
     if not params:
         await query.edit_message_text("No previous generation found")
         return
-    
-    await query.edit_message_text("🎨 Regenerating...")
-    
-    try:
-        engine = get_engine()
-        result = await engine.generate(params)
-        
-        await query.message.reply_photo(
-            photo=result.image,
-            caption=f"✨ Regenerated in {result.total_time:.1f}s"
-        )
-    except Exception as e:
-        await query.edit_message_text(f"❌ Regeneration failed: {e}")
+
+    await query.edit_message_text("⏳ Queued (regen)")
+
+    job_payload = {
+        "id": f"regen_{update.effective_user.id}_{int(time.time() * 1000)}",
+        "user_id": update.effective_user.id,
+        "chat_id": query.message.chat_id,
+        "message_id": query.message.message_id,
+        "params": params,
+    }
+
+    await engine.generation_queue.put(job_payload)
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Generic button callback handler.
-    """
     query = update.callback_query
     await query.answer()
     logger.info(f"Button callback: {query.data}")

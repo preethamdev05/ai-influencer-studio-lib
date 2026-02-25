@@ -25,23 +25,19 @@ async def main():
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN environment variable not set")
         sys.exit(1)
-    
+
     logger.info("Initializing AI Influencer Studio Bot...")
-    
-    # Create bot application
+
     application = create_bot_application(token)
-    
-    # Start worker loop in background
-    worker_task = asyncio.create_task(start_worker_loop())
-    
+
+    worker_task = asyncio.create_task(start_worker_loop(application))
+
     try:
-        # Start bot
         await application.initialize()
         await application.start()
         logger.info("Bot started successfully")
         await application.updater.start_polling()
-        
-        # Keep running
+
         await asyncio.Event().wait()
     except KeyboardInterrupt:
         logger.info("Shutting down bot...")
